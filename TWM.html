@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>颱風警戒監控 | TYPHOON WATCH</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=Noto+Sans+TC:wght@400;500;600;700;900&family=Roboto+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+<script src="typhoon-core.js"></script>
+<style>
+  :root{
+    --ink:#eef4fb; --ink-dim:#9fb2c8; --ink-faint:#5c7089;
+    --brand-cyan:#35c2e8;
+    --alert-red:#ff3b4e; --alert-red-deep:#c4102a;
+    --amber:#f2a93b; --amber-deep:#b5780f;
+    --panel-black: rgba(4,7,12,0.94);
+    --hairline: rgba(140,175,220,0.14);
+    --font-display:'Barlow Condensed','Noto Sans TC',sans-serif;
+    --font-body:'Noto Sans TC',sans-serif;
+    --font-mono:'Roboto Mono',monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{width:100%;height:100%;background:transparent;font-family:var(--font-body);color:var(--ink);overflow:hidden;}
+  body.preview-bg{background:radial-gradient(ellipse 900px 600px at 20% 10%, rgba(53,194,232,0.07), transparent 60%), #05070c;}
+  #scaleWrap{position:fixed;inset:0;overflow:hidden;}
+  #stage{position:absolute;width:1920px;height:1080px;transform-origin:top left;overflow:hidden;}
+
+  /* ---------- top bar (auto-hides for clean OBS capture) ---------- */
+  #topbar{
+    position:absolute; top:0; left:0; right:0; height:56px;
+    display:flex; align-items:center; gap:16px; padding:0 22px;
+    background:rgba(4,7,12,0.82); border-bottom:1px solid var(--hairline);
+    transition:opacity .5s ease; z-index:80;
+  }
+  #topbar.idle{opacity:0; pointer-events:none;}
+  #topbar .dot{width:10px;height:10px;border-radius:50%;background:var(--brand-cyan);animation:pulse 2s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(53,194,232,.55)}70%{box-shadow:0 0 0 10px rgba(53,194,232,0)}100%{box-shadow:0 0 0 0 rgba(53,194,232,0)}}
+  #topbar .title{font-family:var(--font-display);font-weight:800;font-size:18px;letter-spacing:1px;}
+  #topbar .status{font-family:var(--font-mono);font-size:11px;color:var(--ink-dim);}
+  #topbar .status b{color:var(--ink);}
+  #topbar .spacer{flex:1;}
+  #topbar .clock{font-family:var(--font-mono);font-size:13px;color:var(--ink-dim);}
+  #topbar .chip{font-family:var(--font-mono);font-size:11px;color:var(--ink-dim);border:1px solid var(--hairline);padding:6px 12px;border-radius:100px;cursor:pointer;}
+  #topbar .chip:hover{color:var(--brand-cyan);border-color:var(--brand-cyan);}
+  #topbar .gear{width:32px;height:32px;border-radius:7px;border:1px solid var(--hairline);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink-dim);}
+  #topbar .gear:hover{color:var(--brand-cyan);border-color:var(--brand-cyan);}
+  #topbar .gear svg{width:16px;height:16px;}
+  #topbar .spin svg{animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ---------- layout ---------- */
+  #main{position:absolute; top:0; left:0; right:0; bottom:0; display:flex;}
+  #mapPanel{flex:1 1 auto; position:relative; background:#05080e; overflow:hidden;}
+  #sidebar{flex:0 0 480px; background:var(--panel-black); position:relative; overflow-y:auto; border-left:1px solid var(--hairline);}
+  #sidebar::-webkit-scrollbar{width:6px;} #sidebar::-webkit-scrollbar-thumb{background:var(--hairline);border-radius:6px;}
+
+  #mapSvgWrap{position:absolute;inset:0;}
+  #mapSvgWrap svg{width:100%;height:100%;}
+  .county-path{ fill:#2b3644; stroke:#54708c; stroke-width:1.1; transition:fill .8s ease, stroke .8s ease; }
+  .county-path.warn{ fill:url(#stripeRed); stroke:var(--alert-red); stroke-width:2; }
+  .seazone-path{ fill:rgba(255,255,255,0.015); stroke:rgba(140,175,220,0.16); stroke-width:1; stroke-dasharray:2 6; transition:fill 1s ease, stroke .8s ease; }
+  .seazone-path.warn{ fill:url(#stripeRed); stroke:var(--alert-red); stroke-dasharray:none; }
+  .seazone-label{ font-family:var(--font-mono); font-size:14px; fill:var(--ink-faint); text-anchor:middle; pointer-events:none; letter-spacing:1px; }
+  .seazone-label.warn{ fill:#ffd3d8; font-weight:700; }
+
+  #mapCaption{position:absolute; top:22px; left:28px; z-index:5;}
+  #mapCaption h2{font-family:var(--font-display);font-weight:700;font-size:20px;letter-spacing:2px;color:var(--ink-dim);}
+  #mapCaption h2 b{color:var(--ink);}
+  #legend{display:flex;gap:16px;margin-top:8px;font-family:var(--font-mono);font-size:11px;color:var(--ink-dim);}
+  #legend .item{display:flex;align-items:center;gap:6px;}
+  #legend .sw{width:14px;height:14px;border-radius:3px;}
+  #legend .sw.warn{background:repeating-linear-gradient(45deg, var(--alert-red) 0 4px, rgba(0,0,0,0) 4px 8px); border:1px solid var(--alert-red);}
+  #legend .sw.idle{background:#2b3644;border:1px solid #54708c;}
+
+  #hazardChip{
+    position:absolute; left:28px; bottom:26px; z-index:5;
+    display:flex; align-items:center; gap:10px;
+    background: repeating-linear-gradient(45deg, rgba(0,0,0,0.55) 0 8px, rgba(0,0,0,0.75) 8px 16px);
+    border:2px solid var(--amber); border-radius:6px; padding:10px 18px;
+  }
+  #hazardChip span{font-family:var(--font-display);font-weight:800;font-size:18px;letter-spacing:3px;color:var(--amber);}
+  #hazardChip.hide{display:none;}
+
+  #warnFooter{position:absolute; right:28px; bottom:26px; left:340px; z-index:5; display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end;}
+  #warnFooter .chip{font-family:var(--font-mono);font-size:11.5px;padding:5px 12px;border-radius:100px;background:rgba(255,59,78,0.12);border:1px solid rgba(255,59,78,0.5);color:#ffd7db;}
+  #warnFooter .chip.empty{background:rgba(255,255,255,0.04);border-color:var(--hairline);color:var(--ink-faint);}
+
+  /* ---------- sidebar ---------- */
+  #tabs{display:flex; gap:8px; padding:24px 32px 0 32px; flex-wrap:wrap;}
+  #tabs .tab{font-family:var(--font-mono);font-size:12px;padding:7px 14px;border-radius:100px;border:1px solid var(--hairline);color:var(--ink-dim);cursor:pointer;display:flex;align-items:center;gap:6px;}
+  #tabs .tab.active{color:#fff;border-color:var(--brand-cyan);background:rgba(53,194,232,0.12);}
+  #tabs .tab .r{width:6px;height:6px;border-radius:50%;background:var(--alert-red);display:none;}
+  #tabs .tab.hasWarn .r{display:block;}
+
+  #tyBlock{padding:26px 32px 10px 32px; text-align:center;}
+  #tyName{font-family:var(--font-body);font-weight:900;font-size:34px;line-height:1.15;}
+  #tyMeta{font-family:var(--font-body);font-size:15px;color:var(--ink-dim);margin-top:10px;line-height:1.8;}
+  #tyIdle{font-size:14px;color:var(--ink-dim);line-height:1.8;margin-top:14px;}
+
+  #statRows{padding:8px 32px 6px 32px;}
+  .statrow{display:flex;align-items:stretch;gap:16px;padding:16px 0;border-bottom:1px solid var(--hairline);}
+  .statrow .bar{width:4px;border-radius:3px;background:var(--amber);flex:0 0 auto;}
+  .statrow .body{flex:1;}
+  .statrow .k{font-size:13px;color:var(--ink-dim);}
+  .statrow .v{font-family:var(--font-mono);font-weight:700;font-size:38px;color:#fff;margin-top:2px;}
+  .statrow .v .unit{font-family:var(--font-body);font-size:15px;color:var(--ink-dim);font-weight:400;margin-left:6px;}
+
+  #trackBlock{padding:18px 32px;}
+  #trackBlock h4{font-family:var(--font-mono);font-size:11px;letter-spacing:2px;color:var(--ink-faint);margin-bottom:10px;}
+  .track-row{display:flex;gap:10px;font-family:var(--font-mono);font-size:12px;padding:7px 0;border-bottom:1px solid var(--hairline);color:var(--ink-dim);}
+  .track-row .tau{width:44px;color:var(--brand-cyan);font-weight:700;}
+  .track-row .t{width:96px;}
+  .track-row .c{flex:1;color:var(--ink);}
+
+  #areaBlock{padding:6px 32px 30px 32px;}
+  #areaBlock h4{font-family:var(--font-mono);font-size:11px;letter-spacing:2px;color:var(--ink-faint);margin:14px 0 8px 0;}
+  .area-tags{display:flex;flex-wrap:wrap;gap:6px;}
+  .area-tags span{font-size:12px;padding:4px 10px;border-radius:100px;background:rgba(255,255,255,0.04);border:1px solid var(--hairline);color:var(--ink-faint);}
+  .area-tags span.on{background:rgba(255,59,78,0.15);border-color:rgba(255,59,78,0.55);color:#ffd7db;}
+  #bulletinInfo{font-family:var(--font-mono);font-size:11px;color:var(--ink-faint);margin-top:18px;padding-top:14px;border-top:1px solid var(--hairline);line-height:1.8;}
+
+  /* ---------- settings drawer ---------- */
+  #settingsDrawer{position:absolute;top:0;right:0;height:100%;width:420px;background:#070b13;border-left:1px solid var(--hairline);transform:translateX(100%);transition:transform .3s ease;z-index:90;padding:26px;overflow-y:auto;}
+  #settingsDrawer.open{transform:translateX(0);}
+  #settingsDrawer h3{font-family:var(--font-display);font-size:24px;margin-bottom:4px;}
+  #settingsDrawer .sub{color:var(--ink-dim);font-size:12.5px;margin-bottom:20px;}
+  #settingsDrawer .field{margin-bottom:18px;}
+  #settingsDrawer label{display:block;font-size:12px;color:var(--ink-dim);margin-bottom:6px;font-family:var(--font-mono);}
+  #settingsDrawer input[type=number]{width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--hairline);color:var(--ink);padding:9px 10px;border-radius:6px;font-family:var(--font-mono);font-size:13px;}
+  #settingsDrawer .row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+  .toggle{width:44px;height:24px;border-radius:100px;background:rgba(255,255,255,.12);position:relative;cursor:pointer;border:1px solid var(--hairline);flex:0 0 auto;}
+  .toggle .knob{width:18px;height:18px;border-radius:50%;background:var(--ink-dim);position:absolute;top:2px;left:2px;transition:all .2s;}
+  .toggle.on{background:rgba(53,194,232,.35);border-color:var(--brand-cyan);}
+  .toggle.on .knob{left:22px;background:var(--brand-cyan);}
+  #settingsDrawer .btnrow{display:flex;gap:10px;margin-top:10px;}
+  #settingsDrawer button.mini{flex:1;background:rgba(255,255,255,0.05);border:1px solid var(--hairline);color:var(--ink);padding:9px;border-radius:6px;font-family:var(--font-mono);font-size:12px;cursor:pointer;}
+  #settingsDrawer button.mini:hover{border-color:var(--brand-cyan);color:var(--brand-cyan);}
+  #manualPanel{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-top:8px;max-height:220px;overflow-y:auto;}
+  #manualPanel label,#manualPanelSea label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-dim);cursor:pointer;margin:0;}
+  #manualPanelSea{display:flex;flex-direction:column;gap:6px;margin-top:8px;}
+  #debugBox{margin-top:14px;background:#000;border-radius:6px;padding:10px;font-family:var(--font-mono);font-size:10px;color:#7fffb0;max-height:220px;overflow:auto;white-space:pre-wrap;border:1px solid var(--hairline);}
+  #closeDrawer{position:absolute;top:22px;right:22px;width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--ink-dim);border:1px solid var(--hairline);}
+  #closeDrawer:hover{color:var(--brand-cyan);border-color:var(--brand-cyan);}
+  .hint{font-size:11px;color:var(--ink-faint);line-height:1.7;}
+</style>
+</head>
+<body>
+<div id="scaleWrap"><div id="stage">
+
+  <div id="topbar">
+    <div class="dot"></div>
+    <div class="title">TYPHOON WATCH</div>
+    <div class="status">系統狀態 <b id="sysStatus">連線中</b></div>
+    <div class="spacer"></div>
+    <div class="clock" id="clockTime">--:--:--</div>
+    <div class="chip" id="refreshChip" title="立即更新"><span id="refreshLabel">下次更新 60s</span></div>
+    <div class="gear" id="gearBtn" title="設定">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="mapPanel">
+      <div id="mapCaption">
+        <h2>台灣行政區 <b>警戒範圍</b></h2>
+        <div id="legend">
+          <div class="item"><div class="sw warn"></div>颱風警報範圍（陸上／海上）</div>
+          <div class="item"><div class="sw idle"></div>未列警戒</div>
+        </div>
+      </div>
+      <div id="mapSvgWrap"></div>
+      <div id="hazardChip" class="hide"><span>警戒區域</span></div>
+      <div id="warnFooter"></div>
+    </div>
+
+    <div id="sidebar">
+      <div id="tabs"></div>
+      <div id="tyBlock">
+        <div id="tyName">尚無颱風</div>
+        <div id="tyMeta" style="display:none;">
+          <div id="tyDate">—</div>
+          <div id="tyCoord">—</div>
+        </div>
+        <div id="tyIdle">目前無生效中之颱風警報，系統持續監控中央氣象署最新資料。</div>
+      </div>
+
+      <div id="statRows" style="display:none;">
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">中心氣壓</div><div class="v" id="stPressure">—<span class="unit">hPa</span></div></div></div>
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">近中心最大風速</div><div class="v" id="stWind">—<span class="unit">m/s</span></div></div></div>
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">瞬間之最大陣風</div><div class="v" id="stGust">—<span class="unit">m/s</span></div></div></div>
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">七級風平均暴風半徑</div><div class="v" id="stR7">—<span class="unit">km</span></div></div></div>
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">十級風平均暴風半徑</div><div class="v" id="stR10">—<span class="unit">km</span></div></div></div>
+        <div class="statrow"><div class="bar"></div><div class="body"><div class="k">移動方向 / 速度</div><div class="v" id="stMove" style="font-size:22px;">—</div></div></div>
+      </div>
+
+      <div id="trackBlock" style="display:none;">
+        <h4>未來路徑預測 FORECAST TRACK</h4>
+        <div id="trackRows"></div>
+      </div>
+
+      <div id="areaBlock">
+        <h4>陸上颱風警報地區</h4>
+        <div class="area-tags" id="landTags"><span>—</span></div>
+        <h4>海上颱風警報海域</h4>
+        <div class="area-tags" id="seaTags"><span>—</span></div>
+        <div id="bulletinInfo">資料來源：交通部中央氣象署開放資料平臺<br>W-C0034-001（颱風警報）／ W-C0034-005（颱風路徑）<br>尚未取得資料</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="settingsDrawer">
+    <div id="closeDrawer">✕</div>
+    <h3>系統設定</h3>
+    <div class="sub">用於 OBS 疊圖之顯示與資料設定</div>
+    <div class="row"><label style="margin:0;">預覽底色（OBS 擷取請關閉）</label><div class="toggle" id="toggleBg"><div class="knob"></div></div></div>
+    <div class="row"><label style="margin:0;">自動隱藏上方控制列</label><div class="toggle on" id="toggleAutohide"><div class="knob"></div></div></div>
+    <div class="field"><label>自動更新間隔（秒）</label><input type="number" id="intervalInput" min="15" value="60"></div>
+    <div class="btnrow">
+      <button class="mini" id="manualRefreshBtn">立即更新</button>
+      <button class="mini" id="toggleDebugBtn">顯示除錯資料</button>
+    </div>
+    <div id="debugBox" style="display:none;"></div>
+
+    <div class="field" style="margin-top:22px;">
+      <label>颱風資訊模式</label>
+      <div id="infoModeSwitch" style="display:flex;gap:8px;">
+        <button class="mini" id="infoModeAutoBtn" style="border-color:var(--brand-cyan);color:#fff;">即時 API</button>
+        <button class="mini" id="infoModeManualBtn">手動輸入</button>
+      </div>
+    </div>
+    <div id="manualInfoForm" style="display:none;">
+      <div class="field"><label>颱風名稱</label><input type="text" id="miName" placeholder="例：楊柳"></div>
+      <div class="field"><label>強度分類</label>
+        <select id="miClass" style="width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--hairline);color:var(--ink);padding:9px 10px;border-radius:6px;font-family:var(--font-mono);font-size:13px;">
+          <option value="">（不顯示）</option>
+          <option>熱帶性低氣壓</option><option>輕度颱風</option><option>中度颱風</option><option>強烈颱風</option>
+        </select>
+      </div>
+      <div class="field"><label>日期時間文字（例：8月13日8時）</label><input type="text" id="miDate" placeholder="8月13日8時"></div>
+      <div class="row" style="gap:10px;"><input type="number" step="0.1" id="miLat" placeholder="北緯 (度)" style="width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--hairline);color:var(--ink);padding:9px 10px;border-radius:6px;font-family:var(--font-mono);font-size:13px;"><input type="number" step="0.1" id="miLon" placeholder="東經 (度)" style="width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--hairline);color:var(--ink);padding:9px 10px;border-radius:6px;font-family:var(--font-mono);font-size:13px;"></div>
+      <div class="field"><label>中心氣壓 (hPa)</label><input type="number" id="miPressure"></div>
+      <div class="field"><label>近中心最大風速 (m/s)</label><input type="number" id="miWind"></div>
+      <div class="field"><label>瞬間最大陣風 (m/s)</label><input type="number" id="miGust"></div>
+      <div class="field"><label>七級風平均暴風半徑 (km)</label><input type="number" id="miR7"></div>
+      <div class="field"><label>十級風平均暴風半徑 (km)</label><input type="number" id="miR10"></div>
+      <div class="field"><label>移動方向 / 速度</label><input type="text" id="miMove" placeholder="例：北北西　15 km/h"></div>
+      <div class="btnrow"><button class="mini" id="manualInfoApplyBtn">套用手動颱風資訊</button></div>
+    </div>
+
+    <div class="field" style="margin-top:22px;">
+      <label>手動覆蓋 — 陸上警報縣市（自動判讀有誤時使用）</label>
+      <div id="manualPanel"></div>
+    </div>
+    <div class="field">
+      <label>手動覆蓋 — 海上警報海域</label>
+      <div id="manualPanelSea"></div>
+    </div>
+    <div class="btnrow">
+      <button class="mini" id="manualApplyBtn">套用手動設定</button>
+      <button class="mini" id="manualClearBtn">清除並回復自動判讀</button>
+    </div>
+
+    <p class="hint" style="margin-top:22px;">
+      ‧ 地圖使用 taiwan-atlas 公開行政區圖資即時繪製，縣市與海域是否標示警戒採文字比對方式自動判讀氣象署回傳資料；若氣象署調整資料格式導致誤判，請用上方「手動覆蓋」圈選，直播會以手動設定為準，按「清除」可恢復自動判讀。<br><br>
+      ‧ 若同時有多個颱風，上方分頁可切換顯示對象；地圖警戒範圍會依目前選取的颱風更新。<br><br>
+      ‧ OBS 設定：新增「瀏覽器」來源，網址指向本頁面（建議先部署到可公開存取的網頁空間），寬度 1920、高度 1080，關閉「來源不可見時關閉瀏覽器原始碼」即可透明疊加。<br><br>
+      ‧ 另有 info.html 為純颱風資訊卡（不含地圖），適合疊在畫面角落使用。
+    </p>
+  </div>
+
+</div></div>
+
+<script>
+const { COUNTIES, SEAZONES } = TWCore;
+
+const state = {
+  cyclones: [],
+  selectedKey: null,
+  manualLand: null,
+  manualSea: null,
+  infoMode: 'auto',   // 'auto' | 'manual'
+  manualInfo: null,   // {name,cls,dateStr,lat,lon,pressure,wind,gust,r7,r10,move}
+  refreshSec: 60,
+  lastRaw: { warning:null, track:null },
+};
+
+let mapReady = false;
+const mapEls = { counties:{}, seas:{} };
+
+function annularSector(cx,cy,r1,r2,a0,a1){
+  const toRad = d=>(d-90)*Math.PI/180;
+  const x=(r,d)=>cx+r*Math.cos(toRad(d));
+  const y=(r,d)=>cy+r*Math.sin(toRad(d));
+  const large = ((a1-a0+360)%360) > 180 ? 1:0;
+  return [`M ${x(r1,a0)} ${y(r1,a0)}`,`L ${x(r2,a0)} ${y(r2,a0)}`,
+    `A ${r2} ${r2} 0 ${large} 1 ${x(r2,a1)} ${y(r2,a1)}`,
+    `L ${x(r1,a1)} ${y(r1,a1)}`,
+    `A ${r1} ${r1} 0 ${large} 0 ${x(r1,a0)} ${y(r1,a0)}`,'Z'].join(' ');
+}
+
+async function buildRealMap(){
+  const svg = d3.select('#mapSvgWrap').append('svg').attr('viewBox','0 0 1000 1000').attr('preserveAspectRatio','xMidYMid meet');
+  const defs = svg.append('defs');
+  const pat = defs.append('pattern').attr('id','stripeRed').attr('width',10).attr('height',10)
+    .attr('patternTransform','rotate(45)').attr('patternUnits','userSpaceOnUse');
+  pat.append('rect').attr('width',10).attr('height',10).attr('fill','rgba(196,16,42,0.30)');
+  pat.append('rect').attr('width',4).attr('height',10).attr('fill','#ff3b4e').attr('fill-opacity',0.85);
+
+  let topo;
+  try{
+    topo = await fetch('https://cdn.jsdelivr.net/npm/taiwan-atlas/counties-mercator-10t.json',{cache:'force-cache'}).then(r=>r.json());
+  }catch(e){
+    document.getElementById('mapCaption').insertAdjacentHTML('beforeend','<div style="color:#ff8a92;font-family:monospace;font-size:11px;margin-top:8px;">地圖圖資載入失敗，請確認網路連線</div>');
+    return;
+  }
+  const geo = topojson.feature(topo, topo.objects.counties);
+  const projection = d3.geoIdentity();
+  const path = d3.geoPath(projection);
+  // island is fit into a smaller inner box (generous margins) so the compass
+  // sea-zone wedges never overlap the actual coastline
+  projection.fitExtent([[220,250],[780,730]], geo);
+  const b = path.bounds(geo);
+  const cx=(b[0][0]+b[1][0])/2, cy=(b[0][1]+b[1][1])/2;
+  // hypot (not max dimension) so the circle fully encloses the elongated
+  // island regardless of angle, guaranteeing wedges start clear of every
+  // coastline point, however far it juts out
+  const rad = Math.hypot((b[1][0]-b[0][0])/2, (b[1][1]-b[0][1])/2);
+
+  // The old code drew the wedge ring at a fixed rad*1.25→rad*2.1, without
+  // checking how much room is actually left between the island and the
+  // 1000x1000 viewBox edge. For Taiwan's real bounding box that outer
+  // radius (~rad*2.1) comes out far bigger than the canvas, so much of the
+  // ring — and its labels — was silently clipped off-screen. Clamp both
+  // radii to whatever margin is actually available around (cx,cy) instead.
+  const EDGE_PAD = 14; // keep a small buffer so strokes/labels don't touch the very edge
+  const maxSafeR = Math.min(cx, 1000-cx, cy, 1000-cy) - EDGE_PAD;
+  const seaOuterR = Math.min(rad*1.9, maxSafeR);
+  const seaInnerR = Math.min(rad*1.15, seaOuterR - 40);
+
+  const seaG = svg.append('g');
+  SEAZONES.forEach(z=>{
+    const d = annularSector(cx,cy, seaInnerR, seaOuterR, z.a0, z.a1);
+    seaG.append('path').attr('d',d).attr('class','seazone-path').attr('id','seapath-'+z.id);
+    let mid = z.a0 + (((z.a1-z.a0+360)%360))/2; mid = mid%360;
+    const lr = (seaInnerR + seaOuterR) / 2;
+    const lx = cx + lr*Math.cos((mid-90)*Math.PI/180);
+    const ly = cy + lr*Math.sin((mid-90)*Math.PI/180);
+    const t = seaG.append('text').attr('class','seazone-label').attr('id','sealabel-'+z.id).attr('x',lx).attr('y',ly);
+    t.text(z.label);
+    mapEls.seas[z.id] = { path: document.getElementById('seapath-'+z.id), label: document.getElementById('sealabel-'+z.id) };
+  });
+
+  const countyG = svg.append('g');
+  geo.features.forEach(f=>{
+    const nm = f.properties && (f.properties.COUNTYNAME || f.properties.name);
+    const match = COUNTIES.find(c=> c.aliases.includes(nm));
+    const p = countyG.append('path').attr('d', path(f)).attr('class','county-path');
+    if(match){ p.attr('id','county-'+match.id); mapEls.counties[match.id] = p.node(); }
+  });
+
+  mapReady = true;
+  applyMapState();
+}
+
+function setMapWarn(landSet, seaSet){
+  state._land = landSet; state._sea = seaSet;
+  applyMapState();
+}
+function applyMapState(){
+  if(!mapReady) return;
+  const land = state._land || new Set();
+  const sea = state._sea || new Set();
+  Object.keys(mapEls.counties).forEach(id=>{
+    mapEls.counties[id].classList.toggle('warn', land.has(id));
+  });
+  Object.keys(mapEls.seas).forEach(id=>{
+    const on = sea.has(id);
+    mapEls.seas[id].path.classList.toggle('warn', on);
+    mapEls.seas[id].label.classList.toggle('warn', on);
+  });
+  document.getElementById('hazardChip').classList.toggle('hide', !(land.size||sea.size));
+}
+
+buildRealMap();
+
+async function doRefresh(){
+  const chip = document.getElementById('refreshChip');
+  chip.parentElement.classList.add('spin');
+  document.getElementById('sysStatus').textContent = '更新中…';
+  try{
+    const [warningJson, trackJson] = await Promise.all([ TWCore.fetchJSON(TWCore.WARNING_URL), TWCore.fetchJSON(TWCore.TRACK_URL) ]);
+    state.lastRaw.warning = warningJson;
+    state.lastRaw.track = trackJson;
+
+    const trackList = TWCore.getCycloneList(trackJson);
+    const warningInfoList = TWCore.getWarningInfoList(warningJson);
+    const combined = trackList.map(t=>{
+      const key = TWCore.cycloneKey(t);
+      const info = TWCore.findWarningInfoForCyclone(warningInfoList, t);
+      const activeWarning = (info && TWCore.isWarningActive(info)) ? info : null;
+      return { key, track:t, warning:activeWarning };
+    });
+    state.cyclones = combined;
+    if(!state.selectedKey || !combined.find(c=>c.key===state.selectedKey)){
+      state.selectedKey = combined.length ? combined[0].key : null;
+    }
+    document.getElementById('sysStatus').textContent = '連線中';
+    render();
+    updateDebug();
+  }catch(err){
+    document.getElementById('sysStatus').textContent = '連線失敗';
+    console.error('CWA fetch failed', err);
+    updateDebug(err);
+  }finally{
+    chip.parentElement.classList.remove('spin');
+    countdown = state.refreshSec;
+  }
+}
+
+function render(){
+  const tabsEl = document.getElementById('tabs');
+  tabsEl.innerHTML = '';
+  if(state.infoMode==='auto' && state.cyclones.length > 1){
+    state.cyclones.forEach(c=>{
+      const name = TWCore.cycloneChineseName(c.track||c.warning) || TWCore.cycloneEnglishName(c.track||c.warning) || '未命名';
+      const hasWarn = !!c.warning;
+      const el = document.createElement('div');
+      el.className = 'tab'+(c.key===state.selectedKey?' active':'')+(hasWarn?' hasWarn':'');
+      el.innerHTML = `<span class="r"></span>${name}`;
+      el.onclick = ()=>{ state.selectedKey = c.key; render(); };
+      tabsEl.appendChild(el);
+    });
+  }
+
+  const sel = state.cyclones.find(c=>c.key===state.selectedKey);
+  const searchRoot = sel ? { trackData: sel.track, warningData: sel.warning } : null;
+
+  const tyName = document.getElementById('tyName');
+  const tyMeta = document.getElementById('tyMeta');
+  const tyIdle = document.getElementById('tyIdle');
+  const statRows = document.getElementById('statRows');
+  const trackBlock = document.getElementById('trackBlock');
+
+  let landSet = new Set(), seaSet = new Set(), bulletinNo=null, issueTime=null;
+
+  if(state.infoMode==='manual' && state.manualInfo){
+    const mi = state.manualInfo;
+    tyName.textContent = (mi.cls?mi.cls+' ':'') + (mi.name||'未命名颱風');
+    tyIdle.style.display = 'none';
+    tyMeta.style.display = 'block';
+    document.getElementById('tyDate').textContent = mi.dateStr || '—';
+    document.getElementById('tyCoord').textContent = (mi.lat!=null && mi.lon!=null) ? TWCore.fmtLatLon({lat:mi.lat,lon:mi.lon}) : '座標未知';
+    statRows.style.display = 'block';
+    setStat('stPressure', mi.pressure);
+    setStat('stWind', mi.wind);
+    setStat('stGust', mi.gust);
+    setStat('stR7', mi.r7);
+    setStat('stR10', mi.r10);
+    document.getElementById('stMove').textContent = mi.move || '—';
+    trackBlock.style.display = 'none';
+    landSet = state.manualLand || new Set();
+    seaSet = state.manualSea || new Set();
+  } else if(sel){
+    const cname = TWCore.cycloneChineseName(sel.track||sel.warning) || '未命名颱風';
+    const fix = TWCore.extractLatestFix(searchRoot);
+    // NOTE: must search the latest fix only, not the whole cyclone tree —
+    // searching the whole tree matched the FIRST "MaxWindSpeed" it found,
+    // which was the oldest analysis reading, not the current one.
+    const wind = TWCore.firstNumberAny(fix, ['maxwindspeed','windspeed','maxwind','nearcenterwind','wind']);
+    const cls = (sel.warning && TWCore.findSectionScale(sel.warning)) || TWCore.classifyIntensity(wind) || '';
+    tyName.textContent = (cls?cls+' ':'') + cname;
+    tyIdle.style.display = 'none';
+    tyMeta.style.display = 'block';
+
+    const coord = TWCore.parseCoordinate(fix);
+    const ftime = fix ? TWCore.firstStringAny(fix, ['fixtime','datatime','time']) : null;
+    document.getElementById('tyDate').textContent = ftime ? TWCore.fmtZhDateTime(ftime) : '—';
+    document.getElementById('tyCoord').textContent = TWCore.fmtLatLon(coord);
+
+    if(fix){
+      statRows.style.display = 'block';
+      setStat('stPressure', TWCore.firstNumberAny(fix, ['pressure','centralpressure','minpressure']));
+      setStat('stWind', wind);
+      setStat('stGust', TWCore.firstNumberAny(fix, ['maxgustspeed','gustspeed','gust']));
+      setStat('stR7', TWCore.extractRadiusKm(fix, 'circle15ms'));
+      setStat('stR10', TWCore.extractRadiusKm(fix, 'circle25ms'));
+      const dir = TWCore.firstStringAny(fix, ['movingdirection','direction']);
+      const spd = TWCore.firstNumberAny(fix, ['movingspeed','speed']);
+      document.getElementById('stMove').textContent = (dir||'—') + (spd!=null ? '　'+spd+' km/h' : '');
+    } else {
+      statRows.style.display = 'none';
+    }
+
+    const fcasts = TWCore.extractForecastFixes(searchRoot).slice(0,6);
+    const trackRows = document.getElementById('trackRows');
+    if(fcasts.length){
+      trackBlock.style.display = 'block';
+      trackRows.innerHTML = '';
+      fcasts.forEach(f=>{
+        const tau = TWCore.firstStringAny(f, ['tau','forecasthour']) || '';
+        const t = TWCore.firstStringAny(f, ['fixtime','datatime','time']) || '';
+        const c = TWCore.parseCoordinate(f);
+        const row = document.createElement('div');
+        row.className = 'track-row';
+        row.innerHTML = `<div class="tau">${tau?tau+'h':'—'}</div><div class="t">${t?TWCore.fmtTime(t):'—'}</div><div class="c">${c?c.lat.toFixed(1)+'°N '+c.lon.toFixed(1)+'°E':'—'}</div>`;
+        trackRows.appendChild(row);
+      });
+    } else {
+      trackBlock.style.display = 'none';
+    }
+
+    if(sel.warning){
+      const areas = TWCore.warningAreasFromInfo(sel.warning);
+      const meta = TWCore.warningBulletinMeta(sel.warning);
+      landSet = state.manualLand || areas.activeLand;
+      seaSet = state.manualSea || areas.activeSea;
+      bulletinNo = meta.bulletinNo; issueTime = meta.issueTime;
+    } else {
+      landSet = state.manualLand || new Set();
+      seaSet = state.manualSea || new Set();
+    }
+  } else {
+    tyName.textContent = '尚無颱風';
+    tyMeta.style.display = 'none';
+    tyIdle.style.display = 'block';
+    statRows.style.display = 'none';
+    trackBlock.style.display = 'none';
+    landSet = state.manualLand || new Set();
+    seaSet = state.manualSea || new Set();
+  }
+
+  setMapWarn(landSet, seaSet);
+
+  const landTags = document.getElementById('landTags'); landTags.innerHTML='';
+  if(landSet.size){ COUNTIES.forEach(c=>{ if(landSet.has(c.id)){ const s=document.createElement('span'); s.className='on'; s.textContent=c.name; landTags.appendChild(s);} }); }
+  else { landTags.innerHTML = '<span>—</span>'; }
+  const seaTags = document.getElementById('seaTags'); seaTags.innerHTML='';
+  if(seaSet.size){ SEAZONES.forEach(z=>{ if(seaSet.has(z.id)){ const s=document.createElement('span'); s.className='on'; s.textContent=z.label; seaTags.appendChild(s);} }); }
+  else { seaTags.innerHTML = '<span>—</span>'; }
+
+  const warnFooter = document.getElementById('warnFooter'); warnFooter.innerHTML='';
+  const names = [...COUNTIES.filter(c=>landSet.has(c.id)).map(c=>c.name), ...SEAZONES.filter(z=>seaSet.has(z.id)).map(z=>z.label)];
+  if(!names.length){ warnFooter.innerHTML = '<div class="chip empty">目前無縣市／海域列入警戒範圍</div>'; }
+  else{ names.forEach(n=>{ const c=document.createElement('div'); c.className='chip'; c.textContent=n; warnFooter.appendChild(c); }); }
+
+  const bt = document.getElementById('bulletinInfo');
+  let lines = ['資料來源：交通部中央氣象署開放資料平臺'];
+  if(sel){
+    lines.push(sel.warning
+      ? '目前狀態：颱風警報生效中（W-C0034-001）'
+      : '目前狀態：颱風消息，尚無生效中警報（W-C0034-005）');
+  } else {
+    lines.push('W-C0034-001（颱風警報）／ W-C0034-005（颱風消息）');
+  }
+  if(bulletinNo) lines.push('發布編號 '+bulletinNo);
+  if(issueTime) lines.push('發布時間 '+TWCore.fmtTime(issueTime));
+  bt.innerHTML = lines.join('<br>');
+}
+
+function setStat(id, val){
+  const el = document.getElementById(id);
+  const unit = el.querySelector('.unit');
+  const unitHtml = unit ? unit.outerHTML : '';
+  el.innerHTML = (val!=null && !isNaN(val) ? val : '—') + unitHtml;
+}
+
+function updateDebug(err){
+  const box = document.getElementById('debugBox');
+  if(box.style.display==='none') return;
+  let out='';
+  if(err) out += '=== ERROR ===\n'+err+'\n\n';
+  out += '=== W-C0034-001 ===\n'+JSON.stringify(state.lastRaw.warning,null,1).slice(0,4000)+'\n\n';
+  out += '=== W-C0034-005 ===\n'+JSON.stringify(state.lastRaw.track,null,1).slice(0,4000);
+  box.textContent = out;
+}
+
+let countdown = state.refreshSec;
+setInterval(()=>{
+  countdown--;
+  if(countdown<=0) doRefresh();
+  document.getElementById('refreshLabel').textContent = '下次更新 '+Math.max(countdown,0)+'s';
+},1000);
+
+function tickClock(){
+  const d=new Date(); const p=n=>String(n).padStart(2,'0');
+  document.getElementById('clockTime').textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+setInterval(tickClock,1000); tickClock();
+
+let autohide = true, idleTimer=null;
+function armIdle(){
+  document.getElementById('topbar').classList.remove('idle');
+  clearTimeout(idleTimer);
+  if(!autohide) return;
+  idleTimer = setTimeout(()=> document.getElementById('topbar').classList.add('idle'), 3500);
+}
+document.addEventListener('mousemove', armIdle);
+armIdle();
+
+document.getElementById('gearBtn').onclick = ()=> document.getElementById('settingsDrawer').classList.add('open');
+document.getElementById('closeDrawer').onclick = ()=> document.getElementById('settingsDrawer').classList.remove('open');
+document.getElementById('refreshChip').onclick = doRefresh;
+document.getElementById('manualRefreshBtn').onclick = doRefresh;
+document.getElementById('intervalInput').onchange = e=>{ const v=parseInt(e.target.value,10); if(v>=15){ state.refreshSec=v; countdown=v; } };
+
+const bgToggle = document.getElementById('toggleBg'); let bgOn=false;
+bgToggle.onclick = ()=>{ bgOn=!bgOn; bgToggle.classList.toggle('on',bgOn); document.body.classList.toggle('preview-bg',bgOn); };
+
+const autohideToggle = document.getElementById('toggleAutohide');
+autohideToggle.onclick = ()=>{ autohide=!autohide; autohideToggle.classList.toggle('on',autohide); armIdle(); };
+
+let debugOn=false;
+document.getElementById('toggleDebugBtn').onclick = ()=>{
+  debugOn=!debugOn;
+  document.getElementById('debugBox').style.display = debugOn?'block':'none';
+  document.getElementById('toggleDebugBtn').textContent = debugOn?'隱藏除錯資料':'顯示除錯資料';
+  if(debugOn) updateDebug();
+};
+
+const infoModeAutoBtn = document.getElementById('infoModeAutoBtn');
+const infoModeManualBtn = document.getElementById('infoModeManualBtn');
+function setInfoMode(mode){
+  state.infoMode = mode;
+  infoModeAutoBtn.style.borderColor = mode==='auto' ? 'var(--brand-cyan)' : '';
+  infoModeAutoBtn.style.color = mode==='auto' ? '#fff' : '';
+  infoModeManualBtn.style.borderColor = mode==='manual' ? 'var(--brand-cyan)' : '';
+  infoModeManualBtn.style.color = mode==='manual' ? '#fff' : '';
+  document.getElementById('manualInfoForm').style.display = mode==='manual' ? 'block' : 'none';
+  render();
+}
+infoModeAutoBtn.onclick = ()=> setInfoMode('auto');
+infoModeManualBtn.onclick = ()=> setInfoMode('manual');
+document.getElementById('manualInfoApplyBtn').onclick = ()=>{
+  const num = id=>{ const v=document.getElementById(id).value; return v===''?null:parseFloat(v); };
+  const str = id=> document.getElementById(id).value.trim();
+  state.manualInfo = {
+    name: str('miName'), cls: str('miClass'), dateStr: str('miDate'),
+    lat: num('miLat'), lon: num('miLon'),
+    pressure: num('miPressure'), wind: num('miWind'), gust: num('miGust'),
+    r7: num('miR7'), r10: num('miR10'), move: str('miMove'),
+  };
+  state.infoMode = 'manual';
+  render();
+};
+
+const manualPanel = document.getElementById('manualPanel');
+COUNTIES.forEach(c=>{
+  const lab=document.createElement('label');
+  lab.innerHTML = `<input type="checkbox" data-id="${c.id}"> ${c.name}`;
+  manualPanel.appendChild(lab);
+});
+const manualPanelSea = document.getElementById('manualPanelSea');
+SEAZONES.forEach(z=>{
+  const lab=document.createElement('label');
+  lab.innerHTML = `<input type="checkbox" data-id="${z.id}"> ${z.label}`;
+  manualPanelSea.appendChild(lab);
+});
+document.getElementById('manualApplyBtn').onclick = ()=>{
+  const l=new Set(); manualPanel.querySelectorAll('input:checked').forEach(i=>l.add(i.dataset.id));
+  const s=new Set(); manualPanelSea.querySelectorAll('input:checked').forEach(i=>s.add(i.dataset.id));
+  state.manualLand = l; state.manualSea = s;
+  render();
+};
+document.getElementById('manualClearBtn').onclick = ()=>{
+  state.manualLand=null; state.manualSea=null;
+  manualPanel.querySelectorAll('input').forEach(i=>i.checked=false);
+  manualPanelSea.querySelectorAll('input').forEach(i=>i.checked=false);
+  render();
+};
+
+function scaleStage(){
+  const stage=document.getElementById('stage');
+  const sw=window.innerWidth, sh=window.innerHeight;
+  const scale=Math.min(sw/1920, sh/1080);
+  stage.style.transform=`scale(${scale})`;
+  stage.style.left=((sw-1920*scale)/2)+'px';
+  stage.style.top=((sh-1080*scale)/2)+'px';
+}
+window.addEventListener('resize', scaleStage);
+scaleStage();
+
+doRefresh();
+</script>
+</body>
+</html>
