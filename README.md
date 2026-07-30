@@ -172,7 +172,7 @@ The interface is designed for direct overlay on livestreams.
 
 ## 📷 Preview
 
-![Preview](TWM/2026-07-30.png)
+![Preview](2026-07-30.png)
 
 ---
 
