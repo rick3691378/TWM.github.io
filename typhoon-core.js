@@ -128,34 +128,60 @@ function parseCoordinate(fixObj){
 }
 
 /* =========================================================================
-   fetch (with CORS-proxy fallbacks)
+   fetch (with CORS-proxy fallbacks + a hard per-attempt timeout)
    CWA's opendata API doesn't reliably send Access-Control-Allow-Origin, so
-   a direct browser fetch can be blocked by CORS. corsproxy.io alone used to
-   be the only fallback here, but it's a free third-party service that goes
-   down / rate-limits fairly often — when it does, the whole dashboard shows
-   "連線失敗" with no other recourse. Try direct fetch first, then walk
-   through several independent proxy services in turn so a single proxy
-   outage doesn't take the whole app down with it.
+   a direct browser fetch can be blocked by CORS. Free third-party CORS
+   proxies also go down / rate-limit / silently hang (accept the connection
+   but never respond) fairly often. A hung request with no timeout will
+   stall the whole refresh cycle indefinitely — the UI looks "stuck
+   connecting" even though nothing has actually failed yet, it's just still
+   waiting. Every attempt below is capped at FETCH_TIMEOUT_MS so a bad proxy
+   fails fast and the chain moves on instead of hanging forever.
    ========================================================================= */
+const FETCH_TIMEOUT_MS = 8000;
 const CORS_PROXIES = [
-  url => 'https://corsproxy.io/?url=' + encodeURIComponent(url),
-  url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-  url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
-  url => 'https://thingproxy.freeboard.io/fetch/' + url,
+  { name:'direct',      build: url => url },
+  { name:'corsproxy.io',build: url => 'https://corsproxy.io/?url=' + encodeURIComponent(url) },
+  { name:'allorigins',  build: url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url) },
+  { name:'codetabs',    build: url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url) },
+  { name:'thingproxy',  build: url => 'https://thingproxy.freeboard.io/fetch/' + url },
 ];
+let fetchLog = [];
+function logAttempt(label, entry){
+  fetchLog.push({ t: new Date().toISOString(), label, ...entry });
+  if(fetchLog.length > 40) fetchLog.shift();
+}
+function getFetchLog(){ return fetchLog.slice(); }
+
+async function fetchWithTimeout(url, ms){
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), ms);
+  try{
+    return await fetch(url, { cache:'no-store', signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchJSON(url){
   let lastErr = null;
-  try{
-    const res = await fetch(url, { cache:'no-store' });
-    if(!res.ok) throw new Error('HTTP '+res.status);
-    return await res.json();
-  }catch(err){ lastErr = err; }
-  for(const buildProxyUrl of CORS_PROXIES){
+  for(const proxy of CORS_PROXIES){
+    const target = proxy.build(url);
     try{
-      const res = await fetch(buildProxyUrl(url), { cache:'no-store' });
-      if(!res.ok){ lastErr = new Error('HTTP '+res.status+' ('+buildProxyUrl('').slice(0,30)+'…)'); continue; }
-      return await res.json();
-    }catch(err){ lastErr = err; }
+      const res = await fetchWithTimeout(target, FETCH_TIMEOUT_MS);
+      if(!res.ok){
+        lastErr = new Error('HTTP '+res.status);
+        logAttempt(proxy.name, { ok:false, status:res.status });
+        continue;
+      }
+      const json = await res.json();
+      logAttempt(proxy.name, { ok:true });
+      return json;
+    }catch(err){
+      const timedOut = err && err.name === 'AbortError';
+      lastErr = timedOut ? new Error('timeout after '+FETCH_TIMEOUT_MS+'ms') : err;
+      logAttempt(proxy.name, { ok:false, error: String(lastErr && lastErr.message || lastErr) });
+    }
   }
   throw lastErr || new Error('all fetch attempts failed');
 }
@@ -283,7 +309,7 @@ function findSectionValue(infoObj, titleText){
   deepCollect(infoObj, (k,v)=>{
     if(result!=null) return;
     if(k==='section' && Array.isArray(v)){
-      const item = v.find(it=>it && it.title===titleText && 'value' in it);
+      const item = v.find(it=>it && typeof it.title==='string' && it.title.trim()===titleText && 'value' in it);
       if(item) result = item.value;
     }
   });
@@ -317,33 +343,67 @@ function isWarningActive(infoObj){
   if(alertType && /^end$/i.test(String(alertType).trim())) return false;
   return true;
 }
-// match a W-C0034-005 cyclone entry to its W-C0034-001 bulletin (if any) by typhoon name
-function findWarningInfoForCyclone(warningInfoList, cyclone){
-  if(!warningInfoList || !warningInfoList.length) return null;
+// match a W-C0034-005 cyclone entry to its W-C0034-001 bulletin(s). CWA can
+// publish 陸上颱風警報 and 海上颱風警報 for the same storm as TWO SEPARATE
+// CAP info entries (not always merged into one) — using .find() here would
+// silently return only the first and drop the other warning type whenever
+// both are simultaneously in effect. Return every matching entry instead.
+function findWarningInfoListForCyclone(warningInfoList, cyclone){
+  if(!warningInfoList || !warningInfoList.length) return [];
   const zh = cycloneChineseName(cyclone);
   const en = cycloneEnglishName(cyclone);
-  return warningInfoList.find(info=>{
+  const sameName = (a,b) => a && b && (a===b || a.includes(b) || b.includes(a));
+  return warningInfoList.filter(info=>{
     const names = warningTyphoonNames(info);
-    return (zh && names.zh && names.zh===zh) || (en && names.en && names.en===en);
-  }) || null;
+    return sameName(zh, names.zh) || sameName(en, names.en);
+  });
 }
-// land/sea areas under warning, read from the bulletin's own area[] list
-// (exact areaDesc match — far more precise than scanning the whole bulletin
-// text, which also contains unrelated county names in advisory prose)
+// back-compat single-result version (first match only) — kept in case
+// anything still calls it, but prefer *ListForCyclone above
+function findWarningInfoForCyclone(warningInfoList, cyclone){
+  const list = findWarningInfoListForCyclone(warningInfoList, cyclone);
+  return list.length ? list[0] : null;
+}
+// land/sea areas + bulletin meta, merged across every active info entry
+// that matches this cyclone (see note above on why there can be >1)
+function warningAreasForInfoList(infoList){
+  const activeLand = new Set(), activeSea = new Set();
+  let bulletinNo = null, issueTime = null, headline = null;
+  (infoList||[]).forEach(info=>{
+    const a = warningAreasFromInfo(info);
+    a.activeLand.forEach(x=>activeLand.add(x));
+    a.activeSea.forEach(x=>activeSea.add(x));
+    const meta = warningBulletinMeta(info);
+    if(meta.bulletinNo) bulletinNo = meta.bulletinNo;
+    if(meta.issueTime) issueTime = meta.issueTime;
+    if(meta.headline) headline = headline ? headline+'／'+meta.headline : meta.headline;
+  });
+  return { activeLand, activeSea, bulletinNo, issueTime, headline };
+}
+// land/sea areas under warning, read from the bulletin's own area[] list.
+// Substring match (not exact equality) against each areaDesc — CWA doesn't
+// always issue one <area> block per single county; a bulletin can combine
+// several place names into one areaDesc string (e.g. "基隆市、臺北市、新北市"),
+// so requiring an exact match would silently miss every county after the
+// first in a combined string.
 function warningAreasFromInfo(infoObj){
   const activeLand = new Set(), activeSea = new Set();
-  const areaList = (infoObj && infoObj.area) || [];
-  const descs = areaList.map(a=>a && (a.areaDesc || a.AreaDesc)).filter(Boolean);
-  COUNTIES.forEach(c=>{ if(c.aliases.some(a=>descs.includes(a))) activeLand.add(c.id); });
-  SEAZONES.forEach(z=>{ if(z.aliases.some(a=>descs.includes(a))) activeSea.add(z.id); });
+  const areaList = (infoObj && (infoObj.area || infoObj.Area)) || [];
+  let descs = areaList.map(a=>a && (a.areaDesc || a.AreaDesc)).filter(Boolean);
+  // fallback: schema surprises happen — if the expected area[].areaDesc path
+  // came back empty, fall back to a deep search for any areaDesc-like value
+  // anywhere in this info entry rather than silently reporting no warning
+  if(!descs.length) descs = findValuesByKey(infoObj, 'areadesc').filter(v=>typeof v==='string');
+  COUNTIES.forEach(c=>{ if(c.aliases.some(a=>descs.some(d=>d.includes(a)))) activeLand.add(c.id); });
+  SEAZONES.forEach(z=>{ if(z.aliases.some(a=>descs.some(d=>d.includes(a)))) activeSea.add(z.id); });
   return { activeLand, activeSea };
 }
 function warningBulletinMeta(infoObj){
   if(!infoObj) return { bulletinNo:null, issueTime:null, headline:null };
   return {
     bulletinNo: findSectionValue(infoObj,'警報報數'),
-    issueTime: infoObj.effective || infoObj.onset || null,
-    headline: infoObj.headline || null,
+    issueTime: infoObj.effective || infoObj.Effective || infoObj.onset || infoObj.Onset || firstStringAny(infoObj,['effective','onset']) || null,
+    headline: infoObj.headline || infoObj.Headline || firstStringAny(infoObj,['headline']) || null,
   };
 }
 
@@ -386,12 +446,13 @@ function fmtLatLon(coord){
 global.TWCore = {
   WARNING_URL, TRACK_URL,
   COUNTIES, SEAZONES,
-  fetchJSON, getCycloneList,
+  fetchJSON, getFetchLog, getCycloneList,
   cycloneChineseName, cycloneEnglishName, cycloneKey,
   warningAreasForCyclone, extractLatestFix, extractForecastFixes,
   extractRadiusKm,
   getWarningInfoList, findSectionValue, findSectionScale, warningTyphoonNames,
-  isWarningActive, findWarningInfoForCyclone, warningAreasFromInfo, warningBulletinMeta,
+  isWarningActive, findWarningInfoForCyclone, findWarningInfoListForCyclone,
+  warningAreasFromInfo, warningAreasForInfoList, warningBulletinMeta,
   classifyIntensity, fmtTime, fmtZhDateTime, fmtLatLon,
   firstNumber, firstString, firstNumberAny, firstStringAny,
   findArraysByKey, parseCoordinate, deepCollect,

@@ -146,19 +146,29 @@
 const state = { cyclones: [], selectedKey: null, refreshSec: 60, lastRaw:null, infoMode:'auto', manualInfo:null };
 
 async function doRefresh(){
+  let warningFetchOk = true;
   try{
     const trackJson = await TWCore.fetchJSON(TWCore.TRACK_URL);
     let warningJson = null;
-    try{ warningJson = await TWCore.fetchJSON(TWCore.WARNING_URL); }catch(e){}
+    try{ warningJson = await TWCore.fetchJSON(TWCore.WARNING_URL); }catch(e){ warningFetchOk = false; }
     state.lastRaw = trackJson;
+    state.warningFetchOk = warningFetchOk;
 
     const trackList = TWCore.getCycloneList(trackJson);
-    const warningInfoList = warningJson ? TWCore.getWarningInfoList(warningJson) : [];
+    const warningInfoList = (warningJson ? TWCore.getWarningInfoList(warningJson) : []).filter(TWCore.isWarningActive);
     const combined = trackList.map(t=>{
       const key = TWCore.cycloneKey(t);
       const info = TWCore.findWarningInfoForCyclone(warningInfoList, t);
-      const activeWarning = (info && TWCore.isWarningActive(info)) ? info : null;
-      return { key, track:t, warning:activeWarning };
+      return { key, track:t, warning: info };
+    });
+    // don't let a storm disappear just because the track feed hasn't
+    // caught up yet with a warning bulletin that already exists for it
+    const matchedInfos = new Set(combined.map(c=>c.warning).filter(Boolean));
+    warningInfoList.forEach(info=>{
+      if(matchedInfos.has(info)) return;
+      const names = TWCore.warningTyphoonNames(info);
+      const key = names.zh || names.en || JSON.stringify(info).slice(0,40);
+      if(!combined.find(c=>c.key===key)) combined.push({ key, track:null, warning:info });
     });
     state.cyclones = combined;
     if(!state.selectedKey || !combined.find(c=>c.key===state.selectedKey)){
@@ -234,7 +244,9 @@ function render(){
     } else {
       statRows.style.display = 'none';
     }
-    const modeLine = sel.warning ? '目前狀態：颱風警報生效中' : '目前狀態：颱風消息（尚無生效中警報）';
+    const modeLine = sel.warning
+      ? '目前狀態：颱風警報生效中'
+      : (state.warningFetchOk===false ? '⚠ 警報資料連線失敗，無法確認是否生效中' : '目前狀態：颱風消息（尚無生效中警報）');
     document.getElementById('footTime').innerHTML = '資料來源：交通部中央氣象署開放資料平臺<br>'+modeLine+'<br>更新時間 '+ (ftime? TWCore.fmtTime(ftime):'—');
   } else {
     tyName.textContent = '尚無颱風';

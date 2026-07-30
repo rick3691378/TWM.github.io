@@ -395,22 +395,36 @@ async function doRefresh(){
     state.lastRaw.track = trackJson;
 
     const trackList = TWCore.getCycloneList(trackJson);
-    const warningInfoList = TWCore.getWarningInfoList(warningJson);
+    const warningInfoList = TWCore.getWarningInfoList(warningJson).filter(TWCore.isWarningActive);
     const combined = trackList.map(t=>{
       const key = TWCore.cycloneKey(t);
-      const info = TWCore.findWarningInfoForCyclone(warningInfoList, t);
-      const activeWarning = (info && TWCore.isWarningActive(info)) ? info : null;
-      return { key, track:t, warning:activeWarning };
+      const infos = TWCore.findWarningInfoListForCyclone(warningInfoList, t);
+      return { key, track:t, warning: infos }; // warning is an array (can be empty, or hold both a land AND a sea bulletin)
+    });
+    // W-C0034-001 (warnings) and W-C0034-005 (track) are two independent
+    // feeds that can update at slightly different times. If a warning
+    // bulletin exists for a storm that hasn't shown up in the track feed
+    // yet, don't silently drop it — surface it using warning-only data
+    // rather than making the whole storm disappear until track catches up.
+    const matchedInfos = new Set();
+    combined.forEach(c=>c.warning.forEach(w=>matchedInfos.add(w)));
+    warningInfoList.forEach(info=>{
+      if(matchedInfos.has(info)) return;
+      const names = TWCore.warningTyphoonNames(info);
+      const key = names.zh || names.en || JSON.stringify(info).slice(0,40);
+      const existing = combined.find(c=>c.key===key);
+      if(existing) existing.warning.push(info);
+      else combined.push({ key, track:null, warning:[info] });
     });
     state.cyclones = combined;
     if(!state.selectedKey || !combined.find(c=>c.key===state.selectedKey)){
       state.selectedKey = combined.length ? combined[0].key : null;
     }
-    document.getElementById('sysStatus').textContent = '連線中';
+    document.getElementById('sysStatus').textContent = '已連線・更新於 '+nowHHMMSS();
     render();
     updateDebug();
   }catch(err){
-    document.getElementById('sysStatus').textContent = '連線失敗';
+    document.getElementById('sysStatus').textContent = '連線失敗（'+Math.max(countdown,0)+'s 後重試）';
     console.error('CWA fetch failed', err);
     updateDebug(err);
   }finally{
@@ -424,8 +438,8 @@ function render(){
   tabsEl.innerHTML = '';
   if(state.infoMode==='auto' && state.cyclones.length > 1){
     state.cyclones.forEach(c=>{
-      const name = TWCore.cycloneChineseName(c.track||c.warning) || TWCore.cycloneEnglishName(c.track||c.warning) || '未命名';
-      const hasWarn = !!c.warning;
+      const name = TWCore.cycloneChineseName(c.track||(c.warning&&c.warning[0])) || TWCore.cycloneEnglishName(c.track||(c.warning&&c.warning[0])) || '未命名';
+      const hasWarn = !!(c.warning && c.warning.length);
       const el = document.createElement('div');
       el.className = 'tab'+(c.key===state.selectedKey?' active':'')+(hasWarn?' hasWarn':'');
       el.innerHTML = `<span class="r"></span>${name}`;
@@ -463,13 +477,13 @@ function render(){
     landSet = state.manualLand || new Set();
     seaSet = state.manualSea || new Set();
   } else if(sel){
-    const cname = TWCore.cycloneChineseName(sel.track||sel.warning) || '未命名颱風';
+    const cname = TWCore.cycloneChineseName(sel.track||(sel.warning&&sel.warning[0])) || '未命名颱風';
     const fix = TWCore.extractLatestFix(searchRoot);
     // NOTE: must search the latest fix only, not the whole cyclone tree —
     // searching the whole tree matched the FIRST "MaxWindSpeed" it found,
     // which was the oldest analysis reading, not the current one.
     const wind = TWCore.firstNumberAny(fix, ['maxwindspeed','windspeed','maxwind','nearcenterwind','wind']);
-    const cls = (sel.warning && TWCore.findSectionScale(sel.warning)) || TWCore.classifyIntensity(wind) || '';
+    const cls = (sel.warning && sel.warning.length && TWCore.findSectionScale(sel.warning[0])) || TWCore.classifyIntensity(wind) || '';
     tyName.textContent = (cls?cls+' ':'') + cname;
     tyIdle.style.display = 'none';
     tyMeta.style.display = 'block';
@@ -511,12 +525,11 @@ function render(){
       trackBlock.style.display = 'none';
     }
 
-    if(sel.warning){
-      const areas = TWCore.warningAreasFromInfo(sel.warning);
-      const meta = TWCore.warningBulletinMeta(sel.warning);
+    if(sel.warning && sel.warning.length){
+      const areas = TWCore.warningAreasForInfoList(sel.warning);
       landSet = state.manualLand || areas.activeLand;
       seaSet = state.manualSea || areas.activeSea;
-      bulletinNo = meta.bulletinNo; issueTime = meta.issueTime;
+      bulletinNo = areas.bulletinNo; issueTime = areas.issueTime;
     } else {
       landSet = state.manualLand || new Set();
       seaSet = state.manualSea || new Set();
@@ -548,7 +561,7 @@ function render(){
   const bt = document.getElementById('bulletinInfo');
   let lines = ['資料來源：交通部中央氣象署開放資料平臺'];
   if(sel){
-    lines.push(sel.warning
+    lines.push((sel.warning && sel.warning.length)
       ? '目前狀態：颱風警報生效中（W-C0034-001）'
       : '目前狀態：颱風消息，尚無生效中警報（W-C0034-005）');
   } else {
@@ -571,7 +584,13 @@ function updateDebug(err){
   if(box.style.display==='none') return;
   let out='';
   if(err) out += '=== ERROR ===\n'+err+'\n\n';
-  out += '=== W-C0034-001 ===\n'+JSON.stringify(state.lastRaw.warning,null,1).slice(0,4000)+'\n\n';
+  out += '=== FETCH LOG（最近嘗試的來源，由上到下）===\n';
+  const log = TWCore.getFetchLog();
+  if(!log.length) out += '(尚無紀錄)\n';
+  else log.forEach(l=>{
+    out += `${l.t.slice(11,19)}  ${l.label.padEnd(12)}  ${l.ok?'OK':'FAIL'}${l.status?' HTTP '+l.status:''}${l.error?' '+l.error:''}\n`;
+  });
+  out += '\n=== W-C0034-001 ===\n'+JSON.stringify(state.lastRaw.warning,null,1).slice(0,4000)+'\n\n';
   out += '=== W-C0034-005 ===\n'+JSON.stringify(state.lastRaw.track,null,1).slice(0,4000);
   box.textContent = out;
 }
@@ -583,6 +602,10 @@ setInterval(()=>{
   document.getElementById('refreshLabel').textContent = '下次更新 '+Math.max(countdown,0)+'s';
 },1000);
 
+function nowHHMMSS(){
+  const d=new Date(); const p=n=>String(n).padStart(2,'0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 function tickClock(){
   const d=new Date(); const p=n=>String(n).padStart(2,'0');
   document.getElementById('clockTime').textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
